@@ -15,3 +15,7 @@ config/secrets.toml
 
 # Streamlit cache
 .streamlit/
+
+# IDE files
+.vscode/
+.idea/

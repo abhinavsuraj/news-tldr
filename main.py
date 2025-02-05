@@ -18,7 +18,7 @@ async def main():
         workflow = NewsWorkflow()
         
         # Define search parameters
-        search_query = "artificial intelligence latest developments"
+        search_query = "USA Stock market January 2025"
         num_articles = 3
         max_searches = 3
         

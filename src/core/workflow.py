@@ -13,6 +13,23 @@ from ..tools.scraper import WebScraper
 from ..tools.summarizer import ArticleSummarizer
 from ..config.settings import Settings
 import asyncio
+from pydantic import BaseModel, Field
+from langchain_core.output_parsers import JsonOutputParser
+
+class NewsApiParams(BaseModel):
+    """Parameters for NewsAPI query."""
+    q: str = Field(description="Search query string")
+    from_param: str = Field(description="Start date for article search (YYYY-MM-DD)")
+    to: str = Field(description="End date for article search (YYYY-MM-DD)")
+    language: str = Field(default="en", description="Article language")
+    sort_by: str = Field(default="relevancy", description="Sort order for articles")
+    page_size: int = Field(default=100, description="Number of articles to return")
+
+    model_config = {
+        "populate_by_name": True,
+        "validate_assignment": True,
+        "extra": "forbid"
+    }
 
 class NewsWorkflow:
     def __init__(self):
@@ -98,6 +115,19 @@ class NewsWorkflow:
             Respond with only the URLs of selected articles, one per line.
             """
             
+            prompt = f"""
+            Based on the user news query: "{news_query}"
+
+            Select up to {num_articles_tldr} most relevant articles about {news_query}.
+            For each selected article, output ONLY its URL on a new line.
+
+            Available articles:
+            {formatted_metadata}
+
+            Output format example:
+            https://example.com/article1
+            https://example.com/article2
+            """
             self.logger.info(f"Sending prompt to LLM for URL selection")
             result = self.llm.invoke(prompt).content
             
@@ -107,6 +137,9 @@ class NewsWorkflow:
             
             if not urls:
                 self.logger.warning("No URLs extracted from LLM response")
+                # Use first 3 articles as fallback
+                urls = [article['url'] for article in potential_articles[:3]]
+                self.logger.info(f"Using fallback: selected first {len(urls)} articles")
                 return state
                 
             self.logger.info(f"Found {len(urls)} relevant URLs")
@@ -149,6 +182,31 @@ class NewsWorkflow:
             else:
                 return "select_top_urls"
 
+    def format_results(self, state: GraphState) -> GraphState:
+        """Format the results for display."""
+        try:
+            # Format search terms used
+            q = [params["q"] for params in state.get("past_searches", [])]
+            formatted_results = f"Search terms used: {', '.join(q)}\n\n"
+            
+            # Format article summaries
+            if state.get("tldr_articles"):
+                summaries = []
+                for article in state["tldr_articles"]:
+                    if article.get("summary"):
+                        summaries.append(article["summary"])
+                formatted_results += "\n\n".join(summaries)
+            else:
+                formatted_results = "No articles found."
+                
+            state["formatted_results"] = formatted_results
+            return state
+            
+        except Exception as e:
+            self.logger.error(f"Error formatting results: {str(e)}")
+            state["error"] = f"Failed to format results: {str(e)}"
+            return state
+
     def _build_graph(self) -> Graph:
         workflow = Graph()
         
@@ -158,6 +216,7 @@ class NewsWorkflow:
         workflow.add_node("process_articles", self.process_articles)
         workflow.add_node("select_top_urls", self.select_top_urls)
         workflow.add_node("summarize", self.generate_summaries)
+        workflow.add_node("format_results", self.format_results)
         
         # Set entry point
         workflow.set_entry_point("generate_newsapi_params")
@@ -166,7 +225,7 @@ class NewsWorkflow:
         workflow.add_edge("generate_newsapi_params", "fetch_articles")
         workflow.add_edge("fetch_articles", "process_articles")
         
-        # Add conditional edges for process_articles
+        # Add conditional edges
         workflow.add_conditional_edges(
             "process_articles",
             self.articles_text_decision,
@@ -177,50 +236,79 @@ class NewsWorkflow:
             }
         )
         
-        # Add remaining edges
         workflow.add_edge("select_top_urls", "summarize")
-        workflow.add_edge("summarize", END)
+        workflow.add_edge("summarize", "format_results")
+        workflow.add_edge("format_results", END)
         
         return workflow.compile()
 
-
     async def generate_newsapi_params(self, state: GraphState) -> GraphState:
-        """Generates NewsAPI parameters based on the query and date constraints."""
-        
-        today = datetime.now()
-        thirty_days_ago = (today - timedelta(days=29)).strftime("%Y-%m-%d")
-        today_date = today.strftime("%Y-%m-%d")
-
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", "Generate NewsAPI parameters based on the query."),
-            ("user", """
-            Query: {query}
-            Date range: {start_date} to {end_date}
-            Remaining searches: {searches}
-            """)
-        ])
-
-        params = await self.llm.ainvoke(
-            prompt.format_messages(
+        """Generate parameters for NewsAPI query."""
+        try:
+            today = datetime.now()
+            thirty_days_ago = (today - timedelta(days=29)).strftime("%Y-%m-%d")
+            today_date = today.strftime("%Y-%m-%d")
+            
+            # Create prompt template
+            template = """
+            Create a param dict for the News API based on the user query:
+            {query}
+            
+            CRITICAL DATE CONSTRAINTS:
+            - 'from_param' MUST be {thirty_days_ago} or later
+            - 'to' MUST be {today_date}
+            
+            Past searches: {past_searches}
+            Searches remaining: {num_searches_remaining}
+            
+            Return ONLY a JSON object with these fields (no markdown, no code blocks):
+            - q: string (search query terms)
+            - from_param: string (date in YYYY-MM-DD format)
+            - to: string (date in YYYY-MM-DD format)
+            - language: string (default "en")
+            - sort_by: string (default "relevancy")
+            - page_size: integer (default 100)
+            """
+            
+            prompt = ChatPromptTemplate.from_template(template)
+            
+            # Format prompt
+            formatted_prompt = prompt.format(
                 query=state["news_query"],
-                start_date=thirty_days_ago,
-                end_date=today_date,
-                searches=state["num_searches_remaining"]
+                thirty_days_ago=thirty_days_ago,
+                today_date=today_date,
+                past_searches=state.get("past_searches", []),
+                num_searches_remaining=state["num_searches_remaining"]
             )
-        )
+            
+            # Get LLM response
+            response = await self.llm.ainvoke(formatted_prompt)
+            content = response.content
+            
+            # Clean response content
+            if "```" in content:  # Check if content contains code blocks
+                content = content.split("```")[1]
+                if content.startswith("json"):
+                    content = content[4:]
+            
+            # Parse response into NewsApiParams
+            params = NewsApiParams.model_validate_json(content.strip())
+            
+            # Update state
+            state["newsapi_params"] = params.model_dump()
+            if "past_searches" not in state:
+                state["past_searches"] = []
+            state["past_searches"].append(params.model_dump())
+            
+            return state
+            
+        except Exception as e:
+            self.logger.error(f"Error generating NewsAPI parameters: {str(e)}")
+            state["error"] = f"Failed to generate NewsAPI parameters: {str(e)}"
+            return state
 
-        # Validate and sanitize parameters
-        newsapi_params = {
-            "q": state["news_query"],
-            "from_param": thirty_days_ago,
-            "to": today_date,
-            "language": "en",
-            "sort_by": "relevancy",
-            "page_size": 100
-        }
 
-        state["newsapi_params"] = newsapi_params
-        return state
+
 
     async def fetch_articles(self, params: Dict[str, Any]) -> List[Dict[str, Any]]:
         try:
@@ -296,43 +384,60 @@ class NewsWorkflow:
             return {**state, "error": str(e)}
 
     async def generate_summaries(self, state: GraphState) -> GraphState:
-        """Summarize the articles based on full text."""
+        """Summarize articles in parallel using asyncio."""
         try:
-            summaries = []
-            for article in state["tldr_articles"]:
-                try:
-                    summary = await self.summarizer.summarize(article["content"])
-                    if summary:
-                        summaries.append({
-                            "url": article["url"],
-                            "title": article.get("title", ""),
-                            "summary": summary
-                        })
-                except Exception as e:
-                    self.logger.error(f"Error summarizing article {article.get('url')}: {str(e)}")
-                    continue
-            
-            if not summaries:
-                self.logger.warning("No summaries generated")
-                state["error"] = "Failed to generate any summaries"
+            if not state.get("tldr_articles"):
+                self.logger.warning("No articles to summarize")
                 return state
                 
-            state["summaries"] = summaries
-            return state
+            self.logger.info(f"Starting summarization for {len(state['tldr_articles'])} articles")
             
+            # Create tasks for parallel summarization with timeout
+            async def summarize_with_timeout(article):
+                try:
+                    formatted_prompt = f"""
+                    Create a * bulleted summarizing tldr for the article:
+                    {article.get('content', '')}
+                    Be sure to follow the following format exactly with nothing else:
+                    {article.get('title', '')}
+                    {article.get('url', '')}
+                    * tl;dr bulleted summary
+                    * use bullet points for each sentence
+                    """
+                    return await asyncio.wait_for(
+                        self.llm.ainvoke(formatted_prompt),
+                        timeout=30
+                    )
+                except asyncio.TimeoutError:
+                    self.logger.error(f"Summarization timed out for {article.get('url')}")
+                    return None
+                    
+            tasks = [summarize_with_timeout(article) for article in state["tldr_articles"]]
+            
+            # Execute summaries in parallel with overall timeout
+            try:
+                summaries = await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True),
+                    timeout=120
+                )
+                
+                # Update articles with successful summaries
+                for i, summary in enumerate(summaries):
+                    if summary and not isinstance(summary, Exception):
+                        state["tldr_articles"][i]["summary"] = summary.content
+                        
+                self.logger.info(f"Successfully generated {len([s for s in summaries if s])} summaries")
+                return state
+                
+            except asyncio.TimeoutError:
+                self.logger.error("Overall summarization timed out")
+                state["error"] = "Summarization timed out"
+                return state
+                
         except Exception as e:
             self.logger.error(f"Error in generate_summaries: {str(e)}")
             state["error"] = f"Failed to generate summaries: {str(e)}"
             return state
-
-
-    async def check_continue(self, state: GraphState) -> bool:
-        """Determines if the workflow should continue."""
-        return (
-            state["num_searches_remaining"] > 0 
-            and len(state["articles_metadata"]) > 0 
-            and "error" not in state
-        )
 
     async def run(
         self, 
@@ -340,7 +445,6 @@ class NewsWorkflow:
         num_articles_tldr: int = 3,
         num_searches_remaining: int = 3
     ) -> Dict[str, Any]:
-        """Execute the news workflow."""
         try:
             self.logger.info(f"Starting workflow with query: {query}")
             
@@ -352,7 +456,8 @@ class NewsWorkflow:
                 "articles_metadata": [],
                 "scraped_urls": [],
                 "potential_articles": [],
-                "tldr_articles": []
+                "tldr_articles": [],
+                "formatted_results": ""
             }
             
             if not self.validate_state(initial_state):
@@ -376,7 +481,14 @@ class NewsWorkflow:
                 
             return {
                 "success": True,
-                "summaries": result.get("summaries", []),
+                "summaries": [
+                    {
+                        "title": article.get("title", ""),
+                        "url": article.get("url", ""),
+                        "summary": article.get("summary", "")
+                    }
+                    for article in result.get("tldr_articles", [])
+                ],
                 "error": None
             }
             

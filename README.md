@@ -84,29 +84,29 @@ news-tldr/
 - **Result Formatting:** Presents summaries in a readable format
 
 ## Dependencies
-langchain
-langgraph
-openai
-newsapi-python
-beautifulsoup4
-aiohttp
-pydantic
+- langchain
+- langgraph
+- openai
+- newsapi-python
+- beautifulsoup4
+- aiohttp
+- pydantic
 
 ## Error Handling
-Automatic retries for failed requests
-Rate limiting for API calls
-Timeout handling
-Comprehensive logging
+- Automatic retries for failed requests
+- Rate limiting for API calls
+- Timeout handling
+- Comprehensive logging
 
 ## Contributing
-Fork the repository
-Create a feature branch
-Commit your changes
-Push to the branch
-Create a Pull Request
+- Fork the repository
+- Create a feature branch
+- Commit your changes
+- Push to the branch
+- Create a Pull Request
 
 ## License
 ### MIT License
 ```plaintext
-You can copy and paste this into your **README.md** file, and it will be properly formatted when rendered.
+
 ```
